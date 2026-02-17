@@ -153,20 +153,24 @@ struct ContentView: View {
                     .fill(.blue)
                     .frame(height: baseHeight)
                     .overlay(Text("Top Block").foregroundStyle(.white).font(.title2))
+                    .border(.red, width: 2) // red = top block
 
                 // Middle block — pinch to zoom web view
                 // Color.clear reserves layout height; overlay draws the scaled block on top
                 Color.clear
                     .frame(height: baseHeight * scale)
+                    .border(.yellow, width: 2) // yellow = Color.clear layout spacer
                     .overlay(
                         ScaledWebView(url: URL(string: "https://example.com")!, baseWidth: stackWidth, pageZoom: scale)
                             .frame(
                                 width: stackWidth * scale,
                                 height: baseHeight * scale
                             )
+                            .border(.green, width: 2) // green = scaled web view frame
                             .clipShape(RoundedRectangle(cornerRadius: 16))
                             .offset(x: offset)
                     )
+                    .border(.purple, width: 2) // purple = middle block after overlay
                     .modifier(TwoFingerDragModifier(offset: $offset, lastOffset: $lastOffset, isEnabled: scale > 1, maxOffset: maxOffset))
                     .gesture(
                         MagnifyGesture()
@@ -199,6 +203,7 @@ struct ContentView: View {
                     .fill(.orange)
                     .frame(height: baseHeight)
                     .overlay(Text("Bottom Block").foregroundStyle(.white).font(.title2))
+                    .border(.cyan, width: 2) // cyan = bottom block
             }
             .padding()
             .animation(.interactiveSpring(), value: scale)
