@@ -6,6 +6,56 @@
 //
 
 import SwiftUI
+import WebKit
+
+struct ScaledWebView: UIViewRepresentable {
+    let url: URL
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.scrollView.isScrollEnabled = false
+        // Disable all gestures on the web view so our container gestures work
+        webView.scrollView.pinchGestureRecognizer?.isEnabled = false
+        webView.scrollView.panGestureRecognizer.isEnabled = false
+        for gesture in webView.gestureRecognizers ?? [] {
+            gesture.isEnabled = false
+        }
+        webView.isUserInteractionEnabled = false
+        // Scale content to fit width, prevent user scaling
+        let meta = """
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+        """
+        webView.navigationDelegate = context.coordinator
+        webView.load(URLRequest(url: url))
+        context.coordinator.viewportMeta = meta
+        return webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    class Coordinator: NSObject, WKNavigationDelegate {
+        var viewportMeta = ""
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            // Inject viewport meta to prevent web content from having its own zoom
+            let js = """
+            var meta = document.querySelector('meta[name=viewport]');
+            if (!meta) {
+                meta = document.createElement('meta');
+                meta.name = 'viewport';
+                document.head.appendChild(meta);
+            }
+            meta.content = 'width=device-width, initial-scale=1.0, user-scalable=no';
+            """
+            webView.evaluateJavaScript(js)
+        }
+    }
+}
 
 struct TwoFingerDragModifier: ViewModifier {
     @Binding var offset: CGFloat
@@ -100,22 +150,19 @@ struct ContentView: View {
                     .frame(height: baseHeight)
                     .overlay(Text("Top Block").foregroundStyle(.white).font(.title2))
 
-                // Middle block — pinch to zoom
+                // Middle block — pinch to zoom web view
                 // Color.clear reserves layout height; overlay draws the scaled block on top
                 Color.clear
                     .frame(height: baseHeight * scale)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .fill(.green)
+                        ScaledWebView(url: URL(string: "https://example.com")!)
+                            .frame(width: stackWidth, height: baseHeight)
+                            .scaleEffect(scale)
                             .frame(
                                 width: stackWidth * scale,
                                 height: baseHeight * scale
                             )
-                            .overlay(
-                                Text("Pinch to Zoom")
-                                    .foregroundStyle(.white)
-                                    .font(.system(size: 22 * scale))
-                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
                             .offset(x: offset)
                     )
                     .modifier(TwoFingerDragModifier(offset: $offset, lastOffset: $lastOffset, isEnabled: scale > 1, maxOffset: maxOffset))
