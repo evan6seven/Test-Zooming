@@ -11,10 +11,11 @@ struct TwoFingerDragModifier: ViewModifier {
     @Binding var offset: CGFloat
     @Binding var lastOffset: CGFloat
     var isEnabled: Bool
+    var maxOffset: CGFloat
 
     func body(content: Content) -> some View {
         content.overlay(
-            TwoFingerDragView(offset: $offset, lastOffset: $lastOffset, isEnabled: isEnabled)
+            TwoFingerDragView(offset: $offset, lastOffset: $lastOffset, isEnabled: isEnabled, maxOffset: maxOffset)
         )
     }
 }
@@ -23,6 +24,7 @@ struct TwoFingerDragView: UIViewRepresentable {
     @Binding var offset: CGFloat
     @Binding var lastOffset: CGFloat
     var isEnabled: Bool
+    var maxOffset: CGFloat
 
     func makeUIView(context: Context) -> UIView {
         let view = UIView()
@@ -38,21 +40,24 @@ struct TwoFingerDragView: UIViewRepresentable {
         context.coordinator.isEnabled = isEnabled
         context.coordinator.offset = $offset
         context.coordinator.lastOffset = $lastOffset
+        context.coordinator.maxOffset = maxOffset
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(offset: $offset, lastOffset: $lastOffset, isEnabled: isEnabled)
+        Coordinator(offset: $offset, lastOffset: $lastOffset, isEnabled: isEnabled, maxOffset: maxOffset)
     }
 
     class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var offset: Binding<CGFloat>
         var lastOffset: Binding<CGFloat>
         var isEnabled: Bool
+        var maxOffset: CGFloat
 
-        init(offset: Binding<CGFloat>, lastOffset: Binding<CGFloat>, isEnabled: Bool) {
+        init(offset: Binding<CGFloat>, lastOffset: Binding<CGFloat>, isEnabled: Bool, maxOffset: CGFloat) {
             self.offset = offset
             self.lastOffset = lastOffset
             self.isEnabled = isEnabled
+            self.maxOffset = maxOffset
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -66,7 +71,9 @@ struct TwoFingerDragView: UIViewRepresentable {
             case .changed:
                 offset.wrappedValue = lastOffset.wrappedValue + translation.x
             case .ended, .cancelled:
-                lastOffset.wrappedValue = offset.wrappedValue
+                let clamped = min(max(offset.wrappedValue, -maxOffset), maxOffset)
+                offset.wrappedValue = clamped
+                lastOffset.wrappedValue = clamped
             default:
                 break
             }
@@ -81,6 +88,8 @@ struct ContentView: View {
     @State private var lastOffset: CGFloat = 0
 
     private let baseHeight: CGFloat = 150
+    private var stackWidth: CGFloat { UIScreen.main.bounds.width - 32 }
+    private var maxOffset: CGFloat { stackWidth * (scale - 1) / 2 }
 
     var body: some View {
         ScrollView {
@@ -99,7 +108,7 @@ struct ContentView: View {
                         RoundedRectangle(cornerRadius: 16)
                             .fill(.green)
                             .frame(
-                                width: (UIScreen.main.bounds.width - 32) * scale,
+                                width: stackWidth * scale,
                                 height: baseHeight * scale
                             )
                             .overlay(
@@ -109,7 +118,7 @@ struct ContentView: View {
                             )
                             .offset(x: offset)
                     )
-                    .modifier(TwoFingerDragModifier(offset: $offset, lastOffset: $lastOffset, isEnabled: scale > 1))
+                    .modifier(TwoFingerDragModifier(offset: $offset, lastOffset: $lastOffset, isEnabled: scale > 1, maxOffset: maxOffset))
                     .gesture(
                         MagnifyGesture()
                             .onChanged { value in
@@ -120,17 +129,21 @@ struct ContentView: View {
                                 if scale <= 1 {
                                     offset = 0
                                     lastOffset = 0
+                                } else {
+                                    let clamped = min(max(offset, -maxOffset), maxOffset)
+                                    offset = clamped
+                                    lastOffset = clamped
                                 }
                             }
                     )
                     .onTapGesture(count: 2) {
-                        scale = 1.0
-                        lastScale = 1.0
-                        offset = 0
-                        lastOffset = 0
+                        withAnimation(.interactiveSpring()) {
+                            scale = 1.0
+                            lastScale = 1.0
+                            offset = 0
+                            lastOffset = 0
+                        }
                     }
-                    .animation(.interactiveSpring(), value: scale)
-                    .animation(.interactiveSpring(), value: offset)
 
                 // Bottom block
                 RoundedRectangle(cornerRadius: 16)
@@ -139,6 +152,8 @@ struct ContentView: View {
                     .overlay(Text("Bottom Block").foregroundStyle(.white).font(.title2))
             }
             .padding()
+            .animation(.interactiveSpring(), value: scale)
+            .animation(.interactiveSpring(), value: offset)
         }
     }
 }
