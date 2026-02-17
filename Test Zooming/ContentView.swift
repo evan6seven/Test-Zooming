@@ -11,7 +11,7 @@ import WebKit
 struct ScaledWebView: UIViewRepresentable {
     let url: URL
     let baseWidth: CGFloat
-    var pageZoom: CGFloat
+    var scale: CGFloat
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
@@ -26,11 +26,13 @@ struct ScaledWebView: UIViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.load(URLRequest(url: url))
         context.coordinator.baseWidth = baseWidth
+        context.coordinator.currentScale = max(scale, 1)
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        uiView.pageZoom = pageZoom
+        context.coordinator.baseWidth = baseWidth
+        context.coordinator.updateScale(scale, in: uiView)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -39,23 +41,59 @@ struct ScaledWebView: UIViewRepresentable {
 
     class Coordinator: NSObject, WKNavigationDelegate {
         var baseWidth: CGFloat
+        var currentScale: CGFloat = 1
+        private var hasLoadedPage = false
 
         init(baseWidth: CGFloat) {
             self.baseWidth = baseWidth
         }
 
+        func updateScale(_ scale: CGFloat, in webView: WKWebView) {
+            currentScale = max(scale, 1)
+            guard hasLoadedPage else { return }
+            applyTransformScaleCSS(in: webView, scale: currentScale)
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            // Set a fixed viewport width so content layout stays consistent across zoom levels
+            hasLoadedPage = true
             let width = Int(baseWidth)
             let js = """
-            var meta = document.querySelector('meta[name=viewport]');
-            if (!meta) {
-                meta = document.createElement('meta');
-                meta.name = 'viewport';
-                document.head.appendChild(meta);
-            }
-            meta.content = 'width=\(width), initial-scale=1.0, user-scalable=no';
+            (function() {
+                var meta = document.querySelector('meta[name=viewport]');
+                if (!meta) {
+                    meta = document.createElement('meta');
+                    meta.name = 'viewport';
+                    document.head.appendChild(meta);
+                }
+                meta.content = 'width=\(width), initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
+
+                var style = document.getElementById('codex-transform-scale-style');
+                if (!style) {
+                    style = document.createElement('style');
+                    style.id = 'codex-transform-scale-style';
+                    style.textContent = `
+                    :root { --codex-scale: 1; }
+                    html, body {
+                        overflow: hidden !important;
+                    }
+                    body {
+                        transform-origin: top left !important;
+                        transform: scale(var(--codex-scale)) !important;
+                        width: calc(100% / var(--codex-scale)) !important;
+                        min-height: calc(100% / var(--codex-scale)) !important;
+                    }
+                    `;
+                    document.head.appendChild(style);
+                }
+            })();
             """
+            webView.evaluateJavaScript(js)
+            applyTransformScaleCSS(in: webView, scale: currentScale)
+        }
+
+        private func applyTransformScaleCSS(in webView: WKWebView, scale: CGFloat) {
+            let clampedScale = max(scale, 1)
+            let js = "document.documentElement.style.setProperty('--codex-scale', '\(clampedScale)');"
             webView.evaluateJavaScript(js)
         }
     }
@@ -161,7 +199,7 @@ struct ContentView: View {
                     .frame(height: baseHeight * scale)
                     .border(.yellow, width: 2) // yellow = Color.clear layout spacer
                     .overlay(
-                        ScaledWebView(url: URL(string: "https://example.com")!, baseWidth: stackWidth, pageZoom: scale)
+                        ScaledWebView(url: URL(string: "https://google.com")!, baseWidth: stackWidth, scale: scale)
                             .frame(
                                 width: stackWidth * scale,
                                 height: baseHeight * scale
