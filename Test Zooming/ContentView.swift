@@ -10,39 +10,43 @@ import WebKit
 
 struct ScaledWebView: UIViewRepresentable {
     let url: URL
+    let baseWidth: CGFloat
+    var pageZoom: CGFloat
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.scrollView.isScrollEnabled = false
-        // Disable all gestures on the web view so our container gestures work
         webView.scrollView.pinchGestureRecognizer?.isEnabled = false
         webView.scrollView.panGestureRecognizer.isEnabled = false
         for gesture in webView.gestureRecognizers ?? [] {
             gesture.isEnabled = false
         }
         webView.isUserInteractionEnabled = false
-        // Scale content to fit width, prevent user scaling
-        let meta = """
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-        """
         webView.navigationDelegate = context.coordinator
         webView.load(URLRequest(url: url))
-        context.coordinator.viewportMeta = meta
+        context.coordinator.baseWidth = baseWidth
         return webView
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        uiView.pageZoom = pageZoom
+    }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(baseWidth: baseWidth)
     }
 
     class Coordinator: NSObject, WKNavigationDelegate {
-        var viewportMeta = ""
+        var baseWidth: CGFloat
+
+        init(baseWidth: CGFloat) {
+            self.baseWidth = baseWidth
+        }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            // Inject viewport meta to prevent web content from having its own zoom
+            // Set a fixed viewport width so content layout stays consistent across zoom levels
+            let width = Int(baseWidth)
             let js = """
             var meta = document.querySelector('meta[name=viewport]');
             if (!meta) {
@@ -50,7 +54,7 @@ struct ScaledWebView: UIViewRepresentable {
                 meta.name = 'viewport';
                 document.head.appendChild(meta);
             }
-            meta.content = 'width=device-width, initial-scale=1.0, user-scalable=no';
+            meta.content = 'width=\(width), initial-scale=1.0, user-scalable=no';
             """
             webView.evaluateJavaScript(js)
         }
@@ -155,9 +159,7 @@ struct ContentView: View {
                 Color.clear
                     .frame(height: baseHeight * scale)
                     .overlay(
-                        ScaledWebView(url: URL(string: "https://example.com")!)
-                            .frame(width: stackWidth, height: baseHeight)
-                            .scaleEffect(scale)
+                        ScaledWebView(url: URL(string: "https://example.com")!, baseWidth: stackWidth, pageZoom: scale)
                             .frame(
                                 width: stackWidth * scale,
                                 height: baseHeight * scale
