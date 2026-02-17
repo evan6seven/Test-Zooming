@@ -11,6 +11,7 @@ import WebKit
 struct ScaledWebView: UIViewRepresentable {
     let url: URL
     let baseWidth: CGFloat
+    @Binding var contentHeight: CGFloat
     @Binding var scale: CGFloat
     @Binding var lastScale: CGFloat
     @Binding var offset: CGFloat
@@ -48,6 +49,7 @@ struct ScaledWebView: UIViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.load(URLRequest(url: url))
         context.coordinator.baseWidth = baseWidth
+        context.coordinator.contentHeight = $contentHeight
         context.coordinator.currentScale = max(scale, 1)
         context.coordinator.scale = $scale
         context.coordinator.lastScale = $lastScale
@@ -63,6 +65,7 @@ struct ScaledWebView: UIViewRepresentable {
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
         context.coordinator.baseWidth = baseWidth
+        context.coordinator.contentHeight = $contentHeight
         context.coordinator.scale = $scale
         context.coordinator.lastScale = $lastScale
         context.coordinator.offset = $offset
@@ -76,6 +79,7 @@ struct ScaledWebView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             baseWidth: baseWidth,
+            contentHeight: $contentHeight,
             scale: $scale,
             lastScale: $lastScale,
             offset: $offset,
@@ -89,6 +93,7 @@ struct ScaledWebView: UIViewRepresentable {
         var baseWidth: CGFloat
         var currentScale: CGFloat = 1
         private var hasLoadedPage = false
+        var contentHeight: Binding<CGFloat>
         var scale: Binding<CGFloat>
         var lastScale: Binding<CGFloat>
         var offset: Binding<CGFloat>
@@ -101,6 +106,7 @@ struct ScaledWebView: UIViewRepresentable {
 
         init(
             baseWidth: CGFloat,
+            contentHeight: Binding<CGFloat>,
             scale: Binding<CGFloat>,
             lastScale: Binding<CGFloat>,
             offset: Binding<CGFloat>,
@@ -109,6 +115,7 @@ struct ScaledWebView: UIViewRepresentable {
             maxOffset: CGFloat
         ) {
             self.baseWidth = baseWidth
+            self.contentHeight = contentHeight
             self.scale = scale
             self.lastScale = lastScale
             self.offset = offset
@@ -158,12 +165,64 @@ struct ScaledWebView: UIViewRepresentable {
             """
             webView.evaluateJavaScript(js)
             applyTransformScaleCSS(in: webView, scale: currentScale)
+            updateContentHeightWhenImagesReady(in: webView)
         }
 
         private func applyTransformScaleCSS(in webView: WKWebView, scale: CGFloat) {
             let clampedScale = max(scale, 1)
             let js = "document.documentElement.style.setProperty('--codex-scale', '\(clampedScale)');"
             webView.evaluateJavaScript(js)
+        }
+
+        private func updateContentHeight(in webView: WKWebView) {
+            let js = """
+            Math.max(
+                document.documentElement.scrollHeight || 0,
+                document.body ? document.body.scrollHeight : 0,
+                document.documentElement.offsetHeight || 0,
+                document.body ? document.body.offsetHeight : 0
+            );
+            """
+
+            webView.evaluateJavaScript(js) { [weak webView] result, _ in
+                let jsHeight: CGFloat
+                if let number = result as? NSNumber {
+                    jsHeight = CGFloat(truncating: number)
+                } else {
+                    jsHeight = 0
+                }
+
+                let fallbackHeight = webView?.scrollView.contentSize.height ?? 0
+                let resolvedHeight = max(jsHeight, fallbackHeight, 1)
+
+                DispatchQueue.main.async {
+                    self.contentHeight.wrappedValue = resolvedHeight
+                }
+            }
+        }
+
+        private func updateContentHeightWhenImagesReady(in webView: WKWebView, attemptsRemaining: Int = 40) {
+            let js = """
+            (function() {
+                var images = Array.from(document.images || []);
+                if (images.length === 0) { return true; }
+                return images.every(function(img) { return img.complete; });
+            })();
+            """
+
+            webView.evaluateJavaScript(js) { [weak self, weak webView] result, _ in
+                guard let self, let webView else { return }
+                let imagesReady = (result as? Bool) ?? false
+
+                if imagesReady || attemptsRemaining <= 0 {
+                    self.updateContentHeight(in: webView)
+                    return
+                }
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    self.updateContentHeightWhenImagesReady(in: webView, attemptsRemaining: attemptsRemaining - 1)
+                }
+            }
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -230,6 +289,7 @@ struct ScaledWebView: UIViewRepresentable {
 }
 
 struct ContentView: View {
+    @State private var webContentHeight: CGFloat = 150
     @State private var scale: CGFloat = 1.0
     @State private var lastScale: CGFloat = 1.0
     @State private var offset: CGFloat = 0
@@ -252,12 +312,13 @@ struct ContentView: View {
                 // Middle block — pinch to zoom web view
                 // Color.clear reserves layout height; overlay draws the scaled block on top
                 Color.clear
-                    .frame(height: baseHeight * scale)
+                    .frame(height: webContentHeight * scale)
                     .border(.yellow, width: 2) // yellow = Color.clear layout spacer
                     .overlay(
                         ScaledWebView(
                             url: URL(string: "https://google.com")!,
                             baseWidth: stackWidth,
+                            contentHeight: $webContentHeight,
                             scale: $scale,
                             lastScale: $lastScale,
                             offset: $offset,
@@ -267,7 +328,7 @@ struct ContentView: View {
                         )
                             .frame(
                                 width: stackWidth * scale,
-                                height: baseHeight * scale
+                                height: webContentHeight * scale
                             )
                             .border(.green, width: 2) // green = scaled web view frame
                             .clipShape(RoundedRectangle(cornerRadius: 16))
