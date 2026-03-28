@@ -8,345 +8,392 @@
 import SwiftUI
 import WebKit
 
-struct ScaledWebView: UIViewRepresentable {
+struct PlainWebView: UIViewRepresentable {
     let url: URL
-    let baseWidth: CGFloat
-    @Binding var contentHeight: CGFloat
-    @Binding var scale: CGFloat
-    @Binding var lastScale: CGFloat
-    @Binding var offset: CGFloat
-    @Binding var lastOffset: CGFloat
-    var isDragEnabled: Bool
-    var maxOffset: CGFloat
+    @Binding var zoomScale: CGFloat
+    @Binding var frameScale: CGFloat
+    @Binding var baseContentHeight: CGFloat
+    @Binding var pinchGestureScale: CGFloat
+    @Binding var pinchGestureState: String
+    private let metricsHandlerName = "webViewportMetrics"
 
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
+        config.defaultWebpagePreferences.preferredContentMode = .mobile
+        config.ignoresViewportScaleLimits = true
+        config.userContentController.add(context.coordinator, name: metricsHandlerName)
+        config.userContentController.addUserScript(
+            WKUserScript(
+                source: Self.viewportScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
+        config.userContentController.addUserScript(
+            WKUserScript(
+                source: Self.metricsScript(handlerName: metricsHandlerName),
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: true
+            )
+        )
+
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.scrollView.isScrollEnabled = false
-        webView.scrollView.pinchGestureRecognizer?.isEnabled = false
-        webView.scrollView.panGestureRecognizer.isEnabled = false
-
-        let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePan(_:)))
-        pan.minimumNumberOfTouches = 2
-        pan.maximumNumberOfTouches = 2
-        pan.cancelsTouchesInView = false
-        pan.delegate = context.coordinator
-        pan.isEnabled = isDragEnabled
-        webView.addGestureRecognizer(pan)
-
-        let pinch = UIPinchGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handlePinch(_:)))
-        pinch.cancelsTouchesInView = false
-        pinch.delegate = context.coordinator
-        webView.addGestureRecognizer(pinch)
-
-        let doubleTap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
-        doubleTap.numberOfTapsRequired = 2
-        doubleTap.numberOfTouchesRequired = 1
-        doubleTap.cancelsTouchesInView = false
-        doubleTap.delegate = context.coordinator
-        webView.addGestureRecognizer(doubleTap)
-
+        context.coordinator.configure(webView)
         webView.navigationDelegate = context.coordinator
-        webView.load(URLRequest(url: url))
-        context.coordinator.baseWidth = baseWidth
-        context.coordinator.contentHeight = $contentHeight
-        context.coordinator.currentScale = max(scale, 1)
-        context.coordinator.scale = $scale
-        context.coordinator.lastScale = $lastScale
-        context.coordinator.offset = $offset
-        context.coordinator.lastOffset = $lastOffset
-        context.coordinator.isDragEnabled = isDragEnabled
-        context.coordinator.maxOffset = maxOffset
-        context.coordinator.twoFingerPan = pan
-        context.coordinator.pinch = pinch
-        context.coordinator.doubleTap = doubleTap
+        context.coordinator.loadIfNeeded(url, in: webView)
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        context.coordinator.baseWidth = baseWidth
-        context.coordinator.contentHeight = $contentHeight
-        context.coordinator.scale = $scale
-        context.coordinator.lastScale = $lastScale
-        context.coordinator.offset = $offset
-        context.coordinator.lastOffset = $lastOffset
-        context.coordinator.isDragEnabled = isDragEnabled
-        context.coordinator.maxOffset = maxOffset
-        context.coordinator.twoFingerPan?.isEnabled = isDragEnabled
-        context.coordinator.updateScale(scale, in: uiView)
+        context.coordinator.zoomScale = $zoomScale
+        context.coordinator.frameScale = $frameScale
+        context.coordinator.baseContentHeight = $baseContentHeight
+        context.coordinator.pinchGestureScale = $pinchGestureScale
+        context.coordinator.pinchGestureState = $pinchGestureState
+        context.coordinator.configure(uiView)
+        context.coordinator.loadIfNeeded(url, in: uiView)
     }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
-            baseWidth: baseWidth,
-            contentHeight: $contentHeight,
-            scale: $scale,
-            lastScale: $lastScale,
-            offset: $offset,
-            lastOffset: $lastOffset,
-            isDragEnabled: isDragEnabled,
-            maxOffset: maxOffset
+            zoomScale: $zoomScale,
+            frameScale: $frameScale,
+            baseContentHeight: $baseContentHeight,
+            pinchGestureScale: $pinchGestureScale,
+            pinchGestureState: $pinchGestureState
         )
     }
 
-    class Coordinator: NSObject, WKNavigationDelegate, UIGestureRecognizerDelegate {
-        var baseWidth: CGFloat
-        var currentScale: CGFloat = 1
-        private var hasLoadedPage = false
-        var contentHeight: Binding<CGFloat>
-        var scale: Binding<CGFloat>
-        var lastScale: Binding<CGFloat>
-        var offset: Binding<CGFloat>
-        var lastOffset: Binding<CGFloat>
-        var isDragEnabled: Bool
-        var maxOffset: CGFloat
-        weak var twoFingerPan: UIPanGestureRecognizer?
-        weak var pinch: UIPinchGestureRecognizer?
-        weak var doubleTap: UITapGestureRecognizer?
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        uiView.configuration.userContentController.removeScriptMessageHandler(forName: "webViewportMetrics")
+    }
+
+    private static func metricsScript(handlerName: String) -> String {
+        """
+        (function() {
+            if (window.__codexMetricsInstalled) { return; }
+            window.__codexMetricsInstalled = true;
+
+            function measure() {
+                var viewport = window.visualViewport;
+                var scale = viewport && viewport.scale ? viewport.scale : 1;
+                var root = document.scrollingElement || document.documentElement || document.body;
+                var rawHeight = root ? root.scrollHeight : 0;
+
+                window.webkit.messageHandlers.\(handlerName).postMessage({
+                    scale: scale,
+                    rawHeight: rawHeight
+                });
+            }
+
+            var scheduled = false;
+            function scheduleMeasure() {
+                if (scheduled) { return; }
+                scheduled = true;
+                requestAnimationFrame(function() {
+                    scheduled = false;
+                    measure();
+                });
+            }
+
+            window.addEventListener('load', scheduleMeasure, true);
+            document.addEventListener('readystatechange', scheduleMeasure, true);
+            if (window.visualViewport) {
+                window.visualViewport.addEventListener('resize', scheduleMeasure, true);
+            }
+
+            scheduleMeasure();
+        })();
+        """
+    }
+
+    private static let viewportScript = """
+    (function() {
+        var meta = document.querySelector('meta[name="viewport"]');
+        if (!meta) {
+            meta = document.createElement('meta');
+            meta.name = 'viewport';
+            document.head.appendChild(meta);
+        }
+
+        meta.setAttribute(
+            'content',
+            'width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes'
+        );
+    })();
+    """
+
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler, UIGestureRecognizerDelegate {
+        var zoomScale: Binding<CGFloat>
+        var frameScale: Binding<CGFloat>
+        var baseContentHeight: Binding<CGFloat>
+        var pinchGestureScale: Binding<CGFloat>
+        var pinchGestureState: Binding<String>
+        private var loadedURL: URL?
+        private var isPinching = false
+        private var hasLockedBaseHeight = false
+        private weak var webView: WKWebView?
+        private weak var observedPinchGesture: UIPinchGestureRecognizer?
 
         init(
-            baseWidth: CGFloat,
-            contentHeight: Binding<CGFloat>,
-            scale: Binding<CGFloat>,
-            lastScale: Binding<CGFloat>,
-            offset: Binding<CGFloat>,
-            lastOffset: Binding<CGFloat>,
-            isDragEnabled: Bool,
-            maxOffset: CGFloat
+            zoomScale: Binding<CGFloat>,
+            frameScale: Binding<CGFloat>,
+            baseContentHeight: Binding<CGFloat>,
+            pinchGestureScale: Binding<CGFloat>,
+            pinchGestureState: Binding<String>
         ) {
-            self.baseWidth = baseWidth
-            self.contentHeight = contentHeight
-            self.scale = scale
-            self.lastScale = lastScale
-            self.offset = offset
-            self.lastOffset = lastOffset
-            self.isDragEnabled = isDragEnabled
-            self.maxOffset = maxOffset
+            self.zoomScale = zoomScale
+            self.frameScale = frameScale
+            self.baseContentHeight = baseContentHeight
+            self.pinchGestureScale = pinchGestureScale
+            self.pinchGestureState = pinchGestureState
         }
 
-        func updateScale(_ scale: CGFloat, in webView: WKWebView) {
-            currentScale = max(scale, 1)
-            guard hasLoadedPage else { return }
-            applyTransformScaleCSS(in: webView, scale: currentScale)
-        }
+        func configure(_ webView: WKWebView) {
+            self.webView = webView
+            webView.scrollView.isScrollEnabled = false
+            webView.scrollView.alwaysBounceVertical = false
+            webView.scrollView.bounces = false
+            webView.scrollView.contentInsetAdjustmentBehavior = .never
+            webView.scrollView.panGestureRecognizer.isEnabled = false
+            webView.scrollView.pinchGestureRecognizer?.isEnabled = true
 
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            hasLoadedPage = true
-            let width = Int(baseWidth)
-            let js = """
-            (function() {
-                var meta = document.querySelector('meta[name=viewport]');
-                if (!meta) {
-                    meta = document.createElement('meta');
-                    meta.name = 'viewport';
-                    document.head.appendChild(meta);
-                }
-                meta.content = 'width=\(width), initial-scale=1.0, maximum-scale=1.0, user-scalable=no';
-
-                var style = document.getElementById('codex-transform-scale-style');
-                if (!style) {
-                    style = document.createElement('style');
-                    style.id = 'codex-transform-scale-style';
-                    style.textContent = `
-                    :root { --codex-scale: 1; }
-                    html, body {
-                        overflow: hidden !important;
-                    }
-                    body {
-                        transform-origin: top left !important;
-                        transform: scale(var(--codex-scale)) !important;
-                        width: calc(100% / var(--codex-scale)) !important;
-                        min-height: calc(100% / var(--codex-scale)) !important;
-                    }
-                    `;
-                    document.head.appendChild(style);
-                }
-            })();
-            """
-            webView.evaluateJavaScript(js)
-            applyTransformScaleCSS(in: webView, scale: currentScale)
-            updateContentHeightWhenImagesReady(in: webView)
-        }
-
-        private func applyTransformScaleCSS(in webView: WKWebView, scale: CGFloat) {
-            let clampedScale = max(scale, 1)
-            let js = "document.documentElement.style.setProperty('--codex-scale', '\(clampedScale)');"
-            webView.evaluateJavaScript(js)
-        }
-
-        private func updateContentHeight(in webView: WKWebView) {
-            let js = """
-            Math.max(
-                document.documentElement.scrollHeight || 0,
-                document.body ? document.body.scrollHeight : 0,
-                document.documentElement.offsetHeight || 0,
-                document.body ? document.body.offsetHeight : 0
-            );
-            """
-
-            webView.evaluateJavaScript(js) { [weak webView] result, _ in
-                let jsHeight: CGFloat
-                if let number = result as? NSNumber {
-                    jsHeight = CGFloat(truncating: number)
-                } else {
-                    jsHeight = 0
-                }
-
-                let fallbackHeight = webView?.scrollView.contentSize.height ?? 0
-                let resolvedHeight = max(jsHeight, fallbackHeight, 1)
-
-                DispatchQueue.main.async {
-                    self.contentHeight.wrappedValue = resolvedHeight
-                }
+            if observedPinchGesture !== webView.scrollView.pinchGestureRecognizer {
+                observedPinchGesture?.removeTarget(self, action: #selector(handlePinchGesture(_:)))
+                webView.scrollView.pinchGestureRecognizer?.addTarget(
+                    self,
+                    action: #selector(handlePinchGesture(_:))
+                )
+                observedPinchGesture = webView.scrollView.pinchGestureRecognizer
             }
         }
 
-        private func updateContentHeightWhenImagesReady(in webView: WKWebView, attemptsRemaining: Int = 40) {
+        func loadIfNeeded(_ url: URL, in webView: WKWebView) {
+            configure(webView)
+            guard loadedURL != url else { return }
+            loadedURL = url
+            baseContentHeight.wrappedValue = 0
+            hasLockedBaseHeight = false
+            isPinching = false
+            zoomScale.wrappedValue = 1
+            frameScale.wrappedValue = 1
+            pinchGestureScale.wrappedValue = 1
+            pinchGestureState.wrappedValue = "idle"
+            webView.load(URLRequest(url: url))
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            enableNativePageZoom(in: webView)
+            updateMetrics(in: webView)
+            refreshMetrics(in: webView)
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard
+                let body = message.body as? [String: Any]
+            else {
+                return
+            }
+
+            let scale = max((body["scale"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 1, 1)
+            let rawHeight = max((body["rawHeight"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 0, 1)
+            applyMeasurement(rawHeight: rawHeight, fallbackHeight: 0, scale: scale)
+        }
+
+        private func updateMetrics(in webView: WKWebView) {
             let js = """
             (function() {
-                var images = Array.from(document.images || []);
-                if (images.length === 0) { return true; }
-                return images.every(function(img) { return img.complete; });
+                var viewport = window.visualViewport;
+                var scale = viewport && viewport.scale ? viewport.scale : 1;
+                var root = document.scrollingElement || document.documentElement || document.body;
+                var rawHeight = root ? root.scrollHeight : 0;
+                return {
+                    scale: scale,
+                    rawHeight: rawHeight
+                };
             })();
             """
 
             webView.evaluateJavaScript(js) { [weak self, weak webView] result, _ in
+                guard let self else { return }
+                let payload = result as? [String: Any]
+                let scale = max((payload?["scale"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 1, 1)
+                let rawHeight = max((payload?["rawHeight"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 0, 0)
+                let fallbackHeight = max(webView?.scrollView.contentSize.height ?? 0, 0)
+                self.applyMeasurement(rawHeight: rawHeight, fallbackHeight: fallbackHeight, scale: scale)
+            }
+        }
+
+        private func refreshMetrics(in webView: WKWebView, attemptsRemaining: Int = 20) {
+            guard attemptsRemaining > 0 else { return }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak webView] in
                 guard let self, let webView else { return }
-                let imagesReady = (result as? Bool) ?? false
+                guard !self.isPinching else { return }
+                self.updateMetrics(in: webView)
 
-                if imagesReady || attemptsRemaining <= 0 {
-                    self.updateContentHeight(in: webView)
-                    return
-                }
-
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    self.updateContentHeightWhenImagesReady(in: webView, attemptsRemaining: attemptsRemaining - 1)
+                if self.baseContentHeight.wrappedValue <= 1 {
+                    self.refreshMetrics(in: webView, attemptsRemaining: attemptsRemaining - 1)
                 }
             }
         }
 
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-            true
+        private func applyMeasurement(rawHeight: CGFloat, fallbackHeight: CGFloat, scale: CGFloat) {
+            let measuredHeight = rawHeight > 1 ? rawHeight : fallbackHeight
+            guard measuredHeight > 1 || baseContentHeight.wrappedValue > 1 else { return }
+
+            if rawHeight > 1, !hasLockedBaseHeight, !isPinching, scale <= 1.01 {
+                DispatchQueue.main.async {
+                    if abs(self.baseContentHeight.wrappedValue - rawHeight) > 0.5 {
+                        self.baseContentHeight.wrappedValue = rawHeight
+                    }
+                }
+            }
+
+            DispatchQueue.main.async {
+                if abs(self.zoomScale.wrappedValue - scale) > 0.001 {
+                    self.zoomScale.wrappedValue = scale
+                }
+
+                if !self.isPinching, abs(self.frameScale.wrappedValue - scale) > 0.001 {
+                    self.frameScale.wrappedValue = scale
+                }
+            }
         }
 
-        @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
-            guard isDragEnabled else { return }
-            let translation = gesture.translation(in: gesture.view)
+        private func enableNativePageZoom(in webView: WKWebView) {
+            webView.evaluateJavaScript(PlainWebView.viewportScript)
+        }
+
+        @objc
+        func handlePinchGesture(_ gesture: UIPinchGestureRecognizer) {
+            DispatchQueue.main.async {
+                self.pinchGestureScale.wrappedValue = gesture.scale
+                self.pinchGestureState.wrappedValue = switch gesture.state {
+                case .possible: "possible"
+                case .began: "began"
+                case .changed: "changed"
+                case .ended: "ended"
+                case .cancelled: "cancelled"
+                case .failed: "failed"
+                @unknown default: "unknown"
+                }
+            }
+
             switch gesture.state {
+            case .began:
+                isPinching = true
+                hasLockedBaseHeight = true
             case .changed:
-                offset.wrappedValue = lastOffset.wrappedValue + translation.x
-            case .ended, .cancelled:
-                let clamped = min(max(offset.wrappedValue, -maxOffset), maxOffset)
-                offset.wrappedValue = clamped
-                lastOffset.wrappedValue = clamped
+                isPinching = true
+            case .ended, .cancelled, .failed:
+                isPinching = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak webView] in
+                    guard let self, let webView else { return }
+                    self.alignContentToTop(in: webView)
+                    self.updateMetrics(in: webView)
+                    self.refreshMetrics(in: webView, attemptsRemaining: 4)
+                }
             default:
                 break
             }
         }
 
-        @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
-            guard let webView = gesture.view as? WKWebView else { return }
-
-            let newScale = max(1, lastScale.wrappedValue * gesture.scale)
-            scale.wrappedValue = newScale
-            currentScale = newScale
-            applyTransformScaleCSS(in: webView, scale: newScale)
-
-            if newScale <= 1 {
-                isDragEnabled = false
-                twoFingerPan?.isEnabled = false
-                offset.wrappedValue = 0
-                lastOffset.wrappedValue = 0
-            } else {
-                isDragEnabled = true
-                twoFingerPan?.isEnabled = true
-                let clamped = min(max(offset.wrappedValue, -maxOffset), maxOffset)
-                offset.wrappedValue = clamped
-                lastOffset.wrappedValue = clamped
-            }
-
-            if gesture.state == .ended || gesture.state == .cancelled || gesture.state == .failed {
-                lastScale.wrappedValue = newScale
-            }
+        private func alignContentToTop(in webView: WKWebView) {
+            let topOffset = -webView.scrollView.adjustedContentInset.top
+            let currentOffset = webView.scrollView.contentOffset
+            guard abs(currentOffset.y - topOffset) > 0.5 else { return }
+            webView.scrollView.setContentOffset(
+                CGPoint(x: currentOffset.x, y: topOffset),
+                animated: false
+            )
         }
 
-        @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
-            guard gesture.state == .recognized, let webView = gesture.view as? WKWebView else { return }
-
-            withAnimation(.interactiveSpring()) {
-                scale.wrappedValue = 1
-                lastScale.wrappedValue = 1
-                offset.wrappedValue = 0
-                lastOffset.wrappedValue = 0
-            }
-
-            currentScale = 1
-            isDragEnabled = false
-            twoFingerPan?.isEnabled = false
-            applyTransformScaleCSS(in: webView, scale: 1)
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            false
         }
     }
 }
 
-struct ContentView: View {
-    @State private var webContentHeight: CGFloat = 150
-    @State private var scale: CGFloat = 1.0
-    @State private var lastScale: CGFloat = 1.0
-    @State private var offset: CGFloat = 0
-    @State private var lastOffset: CGFloat = 0
+struct WebZoomView: View {
+    @State private var zoomScale: CGFloat = 1
+    @State private var frameScale: CGFloat = 1
+    @State private var baseContentHeight: CGFloat = 1
+    @State private var pinchGestureScale: CGFloat = 1
+    @State private var pinchGestureState: String = "idle"
 
-    private let baseHeight: CGFloat = 150
-    private var stackWidth: CGFloat { UIScreen.main.bounds.width - 32 }
-    private var maxOffset: CGFloat { stackWidth * (scale - 1) / 2 }
+    private let blockHeight: CGFloat = 150
+    private let placeholderHeight: CGFloat = 320
+
+    private var resolvedWebHeight: CGFloat {
+        let baseHeight = baseContentHeight > 1 ? baseContentHeight : placeholderHeight
+        return baseHeight * max(frameScale, 1)
+    }
 
     var body: some View {
         ScrollView {
             VStack(spacing: 20) {
-                // Top block
                 RoundedRectangle(cornerRadius: 16)
                     .fill(.blue)
-                    .frame(height: baseHeight)
-                    .overlay(Text("Top Block").foregroundStyle(.white).font(.title2))
-                    .border(.red, width: 2) // red = top block
+                    .frame(height: blockHeight)
+                    .overlay {
+                        Text("Top Block")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                    }
 
-                // Middle block — pinch to zoom web view
-                // Color.clear reserves layout height; overlay draws the scaled block on top
-                Color.clear
-                    .frame(height: webContentHeight * scale)
-                    .border(.yellow, width: 2) // yellow = Color.clear layout spacer
-                    .overlay(
-                        ScaledWebView(
-                            url: URL(string: "https://google.com")!,
-                            baseWidth: stackWidth,
-                            contentHeight: $webContentHeight,
-                            scale: $scale,
-                            lastScale: $lastScale,
-                            offset: $offset,
-                            lastOffset: $lastOffset,
-                            isDragEnabled: scale > 1,
-                            maxOffset: maxOffset
-                        )
-                            .frame(
-                                width: stackWidth * scale,
-                                height: webContentHeight * scale
-                            )
-                            .border(.green, width: 2) // green = scaled web view frame
-                            .clipShape(RoundedRectangle(cornerRadius: 16))
-                            .offset(x: offset)
-                    )
-                    .border(.purple, width: 2) // purple = middle block after overlay
+                PlainWebView(
+                    url: URL(string: "https://evan6seven.github.io/Test-Zooming/")!,
+                    zoomScale: $zoomScale,
+                    frameScale: $frameScale,
+                    baseContentHeight: $baseContentHeight,
+                    pinchGestureScale: $pinchGestureScale,
+                    pinchGestureState: $pinchGestureState
+                )
+                    .frame(maxWidth: .infinity)
+                    .frame(height: resolvedWebHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(.secondary, lineWidth: 1)
+                    }
+                    .overlay(alignment: .topLeading) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("zoom \(zoomScale, format: .number.precision(.fractionLength(2)))")
+                            Text("frame \(frameScale, format: .number.precision(.fractionLength(2)))")
+                            Text("base \(baseContentHeight, format: .number.precision(.fractionLength(0)))")
+                            Text("height \(resolvedWebHeight, format: .number.precision(.fractionLength(0)))")
+                            Text("pinch \(pinchGestureState)")
+                            Text("gesture \(pinchGestureScale, format: .number.precision(.fractionLength(2)))")
+                        }
+                        .font(.caption.monospacedDigit())
+                        .padding(8)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                        .padding(12)
+                    }
 
-                // Bottom block
                 RoundedRectangle(cornerRadius: 16)
                     .fill(.orange)
-                    .frame(height: baseHeight)
-                    .overlay(Text("Bottom Block").foregroundStyle(.white).font(.title2))
-                    .border(.cyan, width: 2) // cyan = bottom block
+                    .frame(height: blockHeight)
+                    .overlay {
+                        Text("Bottom Block")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                    }
             }
             .padding()
-            .animation(.interactiveSpring(), value: scale)
-            .animation(.interactiveSpring(), value: offset)
+            .frame(maxWidth: .infinity, alignment: .top)
         }
+        .background(.background)
+        .animation(.interactiveSpring(), value: zoomScale)
+        .animation(.interactiveSpring(), value: frameScale)
+        .animation(.interactiveSpring(), value: baseContentHeight)
+    }
+}
+
+struct ContentView: View {
+    var body: some View {
+        WebZoomView()
     }
 }
 
