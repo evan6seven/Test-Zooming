@@ -8,7 +8,140 @@
 import SwiftUI
 import WebKit
 
-struct PlainWebView: UIViewRepresentable {
+#if os(macOS)
+import AppKit
+typealias PlainWebViewRepresentable = NSViewRepresentable
+
+private final class PlatformWKWebView: WKWebView {
+    var magnifyEventHandler: ((PlatformWKWebView, NSEvent) -> Bool)?
+    var layoutHandler: ((PlatformWKWebView) -> Void)?
+    private var scrollEventMonitor: Any?
+    private var lastLaidOutSize: CGSize = .zero
+
+    deinit {
+        removeScrollEventMonitor()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+
+        if window == nil {
+            removeScrollEventMonitor()
+        } else {
+            installScrollEventMonitor()
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        forwardScrollWheelToAncestor(event)
+    }
+
+    override func layout() {
+        super.layout()
+
+        guard bounds.size != lastLaidOutSize else { return }
+        lastLaidOutSize = bounds.size
+        layoutHandler?(self)
+    }
+
+    override func magnify(with event: NSEvent) {
+        if magnifyEventHandler?(self, event) == true {
+            return
+        }
+        super.magnify(with: event)
+    }
+
+    func alignMagnifiedContentToTop() {
+        for scrollView in descendantScrollViews() {
+            guard let documentView = scrollView.documentView else { continue }
+
+            scrollView.layoutSubtreeIfNeeded()
+            documentView.layoutSubtreeIfNeeded()
+
+            let visibleHeight = scrollView.contentView.bounds.height
+            let contentHeight = documentView.bounds.height
+            let targetY: CGFloat
+
+            if documentView.isFlipped {
+                targetY = 0
+            } else {
+                targetY = max(contentHeight - visibleHeight, 0)
+            }
+
+            let targetX = scrollView.contentView.bounds.origin.x
+            let targetPoint = NSPoint(x: targetX, y: targetY)
+            if scrollView.contentView.bounds.origin != targetPoint {
+                scrollView.contentView.scroll(to: targetPoint)
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
+        }
+    }
+
+    private func installScrollEventMonitor() {
+        guard scrollEventMonitor == nil else { return }
+
+        scrollEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel]) { [weak self] event in
+            guard let self, let window = self.window, event.window === window else {
+                return event
+            }
+
+            let location = self.convert(event.locationInWindow, from: nil)
+            guard self.bounds.contains(location) else {
+                return event
+            }
+
+            self.forwardScrollWheelToAncestor(event)
+            return nil
+        }
+    }
+
+    private func removeScrollEventMonitor() {
+        guard let scrollEventMonitor else { return }
+        NSEvent.removeMonitor(scrollEventMonitor)
+        self.scrollEventMonitor = nil
+    }
+
+    private func forwardScrollWheelToAncestor(_ event: NSEvent) {
+        var ancestor: NSView? = superview
+        while let current = ancestor {
+            if let scrollView = current as? NSScrollView {
+                scrollView.scrollWheel(with: event)
+                return
+            }
+            ancestor = current.superview
+        }
+    }
+
+    private func descendantScrollViews() -> [NSScrollView] {
+        findDescendantScrollViews(in: self)
+            .sorted { lhs, rhs in
+                let lhsSize = lhs.documentView?.bounds.height ?? 0
+                let rhsSize = rhs.documentView?.bounds.height ?? 0
+                return lhsSize > rhsSize
+            }
+    }
+
+    private func findDescendantScrollViews(in view: NSView) -> [NSScrollView] {
+        var matches: [NSScrollView] = []
+
+        for subview in view.subviews {
+            if let scrollView = subview as? NSScrollView {
+                matches.append(scrollView)
+            }
+
+            matches.append(contentsOf: findDescendantScrollViews(in: subview))
+        }
+
+        return matches
+    }
+}
+#else
+import UIKit
+typealias PlainWebViewRepresentable = UIViewRepresentable
+typealias PlatformWKWebView = WKWebView
+#endif
+
+struct PlainWebView: PlainWebViewRepresentable {
     let url: URL
     @Binding var zoomScale: CGFloat
     @Binding var frameScale: CGFloat
@@ -17,11 +150,59 @@ struct PlainWebView: UIViewRepresentable {
     @Binding var pinchGestureState: String
     private let metricsHandlerName = "webViewportMetrics"
 
+    #if os(macOS)
+    func makeNSView(context: Context) -> WKWebView {
+        let webView = makeWebView(with: context.coordinator)
+        context.coordinator.loadIfNeeded(url, in: webView)
+        return webView
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        updateWebView(nsView, with: context.coordinator)
+    }
+
+    static func dismantleNSView(_ nsView: WKWebView, coordinator: Coordinator) {
+        coordinator.teardown(from: nsView)
+    }
+    #else
     func makeUIView(context: Context) -> WKWebView {
+        let webView = makeWebView(with: context.coordinator)
+        context.coordinator.loadIfNeeded(url, in: webView)
+        return webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        updateWebView(uiView, with: context.coordinator)
+    }
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        coordinator.teardown(from: uiView)
+    }
+    #endif
+
+    private func makeWebView(with coordinator: Coordinator) -> WKWebView {
         let config = WKWebViewConfiguration()
+        configure(config, handler: coordinator)
+        let webView = PlatformWKWebView(frame: .zero, configuration: config)
+        coordinator.configure(webView)
+        webView.navigationDelegate = coordinator
+        return webView
+    }
+
+    private func updateWebView(_ webView: WKWebView, with coordinator: Coordinator) {
+        coordinator.zoomScale = $zoomScale
+        coordinator.frameScale = $frameScale
+        coordinator.baseContentHeight = $baseContentHeight
+        coordinator.pinchGestureScale = $pinchGestureScale
+        coordinator.pinchGestureState = $pinchGestureState
+        coordinator.configure(webView)
+        coordinator.loadIfNeeded(url, in: webView)
+    }
+
+    private func configure(_ config: WKWebViewConfiguration, handler: Coordinator) {
+        #if os(iOS)
         config.defaultWebpagePreferences.preferredContentMode = .mobile
         config.ignoresViewportScaleLimits = true
-        config.userContentController.add(context.coordinator, name: metricsHandlerName)
         config.userContentController.addUserScript(
             WKUserScript(
                 source: Self.viewportScript,
@@ -29,6 +210,9 @@ struct PlainWebView: UIViewRepresentable {
                 forMainFrameOnly: true
             )
         )
+        #endif
+
+        config.userContentController.add(handler, name: metricsHandlerName)
         config.userContentController.addUserScript(
             WKUserScript(
                 source: Self.metricsScript(handlerName: metricsHandlerName),
@@ -36,22 +220,6 @@ struct PlainWebView: UIViewRepresentable {
                 forMainFrameOnly: true
             )
         )
-
-        let webView = WKWebView(frame: .zero, configuration: config)
-        context.coordinator.configure(webView)
-        webView.navigationDelegate = context.coordinator
-        context.coordinator.loadIfNeeded(url, in: webView)
-        return webView
-    }
-
-    func updateUIView(_ uiView: WKWebView, context: Context) {
-        context.coordinator.zoomScale = $zoomScale
-        context.coordinator.frameScale = $frameScale
-        context.coordinator.baseContentHeight = $baseContentHeight
-        context.coordinator.pinchGestureScale = $pinchGestureScale
-        context.coordinator.pinchGestureState = $pinchGestureState
-        context.coordinator.configure(uiView)
-        context.coordinator.loadIfNeeded(url, in: uiView)
     }
 
     func makeCoordinator() -> Coordinator {
@@ -62,10 +230,6 @@ struct PlainWebView: UIViewRepresentable {
             pinchGestureScale: $pinchGestureScale,
             pinchGestureState: $pinchGestureState
         )
-    }
-
-    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
-        uiView.configuration.userContentController.removeScriptMessageHandler(forName: "webViewportMetrics")
     }
 
     private static func metricsScript(handlerName: String) -> String {
@@ -123,7 +287,7 @@ struct PlainWebView: UIViewRepresentable {
     })();
     """
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var zoomScale: Binding<CGFloat>
         var frameScale: Binding<CGFloat>
         var baseContentHeight: Binding<CGFloat>
@@ -132,8 +296,16 @@ struct PlainWebView: UIViewRepresentable {
         private var loadedURL: URL?
         private var isPinching = false
         private var hasLockedBaseHeight = false
+        private var lockedBaseHeight: CGFloat?
         private weak var webView: WKWebView?
+        #if os(iOS)
         private weak var observedPinchGesture: UIPinchGestureRecognizer?
+        #else
+        private var observedMagnification: NSKeyValueObservation?
+        private var pendingMagnificationCommit: DispatchWorkItem?
+        private var pendingAlignmentWorkItem: DispatchWorkItem?
+        private var suppressMagnificationObservation = false
+        #endif
 
         init(
             zoomScale: Binding<CGFloat>,
@@ -151,11 +323,11 @@ struct PlainWebView: UIViewRepresentable {
 
         func configure(_ webView: WKWebView) {
             self.webView = webView
+            #if os(iOS)
             webView.scrollView.isScrollEnabled = false
             webView.scrollView.alwaysBounceVertical = false
             webView.scrollView.bounces = false
             webView.scrollView.contentInsetAdjustmentBehavior = .never
-            webView.scrollView.panGestureRecognizer.isEnabled = false
             webView.scrollView.pinchGestureRecognizer?.isEnabled = true
 
             if observedPinchGesture !== webView.scrollView.pinchGestureRecognizer {
@@ -166,6 +338,38 @@ struct PlainWebView: UIViewRepresentable {
                 )
                 observedPinchGesture = webView.scrollView.pinchGestureRecognizer
             }
+            #else
+            webView.allowsMagnification = true
+            if let webView = webView as? PlatformWKWebView {
+                webView.magnifyEventHandler = { [weak self] webView, event in
+                    self?.handleMagnifyEvent(event, in: webView) ?? false
+                }
+                webView.layoutHandler = { [weak self] webView in
+                    self?.handlePlatformLayout(in: webView)
+                }
+            }
+            observeMagnification(on: webView)
+            #endif
+        }
+
+        func teardown(from webView: WKWebView) {
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "webViewportMetrics")
+            #if os(iOS)
+            observedPinchGesture?.removeTarget(self, action: #selector(handlePinchGesture(_:)))
+            observedPinchGesture = nil
+            #else
+            if let webView = webView as? PlatformWKWebView {
+                webView.magnifyEventHandler = nil
+                webView.layoutHandler = nil
+            }
+            observedMagnification?.invalidate()
+            observedMagnification = nil
+            pendingMagnificationCommit?.cancel()
+            pendingMagnificationCommit = nil
+            pendingAlignmentWorkItem?.cancel()
+            pendingAlignmentWorkItem = nil
+            #endif
+            self.webView = nil
         }
 
         func loadIfNeeded(_ url: URL, in webView: WKWebView) {
@@ -174,11 +378,19 @@ struct PlainWebView: UIViewRepresentable {
             loadedURL = url
             baseContentHeight.wrappedValue = 0
             hasLockedBaseHeight = false
+            lockedBaseHeight = nil
             isPinching = false
             zoomScale.wrappedValue = 1
             frameScale.wrappedValue = 1
             pinchGestureScale.wrappedValue = 1
             pinchGestureState.wrappedValue = "idle"
+            #if os(macOS)
+            suppressMagnificationObservation = true
+            webView.setMagnification(1, centeredAt: .zero)
+            suppressMagnificationObservation = false
+            pendingAlignmentWorkItem?.cancel()
+            pendingAlignmentWorkItem = nil
+            #endif
             webView.load(URLRequest(url: url))
         }
 
@@ -195,8 +407,9 @@ struct PlainWebView: UIViewRepresentable {
                 return
             }
 
-            let scale = max((body["scale"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 1, 1)
+            let reportedScale = max((body["scale"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 1, 1)
             let rawHeight = max((body["rawHeight"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 0, 1)
+            let scale = currentScale(reportedScale: reportedScale, in: webView)
             applyMeasurement(rawHeight: rawHeight, fallbackHeight: 0, scale: scale)
         }
 
@@ -217,9 +430,14 @@ struct PlainWebView: UIViewRepresentable {
             webView.evaluateJavaScript(js) { [weak self, weak webView] result, _ in
                 guard let self else { return }
                 let payload = result as? [String: Any]
-                let scale = max((payload?["scale"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 1, 1)
+                let reportedScale = max((payload?["scale"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 1, 1)
                 let rawHeight = max((payload?["rawHeight"] as? NSNumber).map(CGFloat.init(truncating:)) ?? 0, 0)
+                let scale = self.currentScale(reportedScale: reportedScale, in: webView)
+                #if os(iOS)
                 let fallbackHeight = max(webView?.scrollView.contentSize.height ?? 0, 0)
+                #else
+                let fallbackHeight: CGFloat = 0
+                #endif
                 self.applyMeasurement(rawHeight: rawHeight, fallbackHeight: fallbackHeight, scale: scale)
             }
         }
@@ -242,7 +460,13 @@ struct PlainWebView: UIViewRepresentable {
             let measuredHeight = rawHeight > 1 ? rawHeight : fallbackHeight
             guard measuredHeight > 1 || baseContentHeight.wrappedValue > 1 else { return }
 
-            if rawHeight > 1, !hasLockedBaseHeight, !isPinching, scale <= 1.01 {
+            if let lockedBaseHeight {
+                DispatchQueue.main.async {
+                    if abs(self.baseContentHeight.wrappedValue - lockedBaseHeight) > 0.5 {
+                        self.baseContentHeight.wrappedValue = lockedBaseHeight
+                    }
+                }
+            } else if rawHeight > 1, !hasLockedBaseHeight, !isPinching, scale <= 1.01 {
                 DispatchQueue.main.async {
                     if abs(self.baseContentHeight.wrappedValue - rawHeight) > 0.5 {
                         self.baseContentHeight.wrappedValue = rawHeight
@@ -262,9 +486,21 @@ struct PlainWebView: UIViewRepresentable {
         }
 
         private func enableNativePageZoom(in webView: WKWebView) {
+            #if os(iOS)
             webView.evaluateJavaScript(PlainWebView.viewportScript)
+            #endif
         }
 
+        private func currentScale(reportedScale: CGFloat, in webView: WKWebView?) -> CGFloat {
+            #if os(macOS)
+            if let webView {
+                return max(webView.magnification, 1)
+            }
+            #endif
+            return max(reportedScale, 1)
+        }
+
+        #if os(iOS)
         @objc
         func handlePinchGesture(_ gesture: UIPinchGestureRecognizer) {
             DispatchQueue.main.async {
@@ -283,7 +519,7 @@ struct PlainWebView: UIViewRepresentable {
             switch gesture.state {
             case .began:
                 isPinching = true
-                hasLockedBaseHeight = true
+                lockBaseHeightIfNeeded()
             case .changed:
                 isPinching = true
             case .ended, .cancelled, .failed:
@@ -298,8 +534,97 @@ struct PlainWebView: UIViewRepresentable {
                 break
             }
         }
+        #else
+        private func handleMagnifyEvent(_ event: NSEvent, in webView: PlatformWKWebView) -> Bool {
+            switch event.phase {
+            case .mayBegin, .began, .changed:
+                isPinching = true
+                lockBaseHeightIfNeeded()
+                return false
+            case .ended, .cancelled:
+                isPinching = false
+                return false
+            default:
+                return false
+            }
+        }
+
+        private func observeMagnification(on webView: WKWebView) {
+            guard observedMagnification == nil else { return }
+            observedMagnification = webView.observe(\.magnification, options: [.new]) { [weak self, weak webView] view, _ in
+                guard let self, let webView, !self.suppressMagnificationObservation else { return }
+                self.handleMagnificationChange(in: webView, scale: max(view.magnification, 1))
+            }
+        }
+
+        private func handleMagnificationChange(in webView: WKWebView, scale: CGFloat) {
+            isPinching = true
+            lockBaseHeightIfNeeded()
+
+            DispatchQueue.main.async {
+                if abs(self.zoomScale.wrappedValue - scale) > 0.001 {
+                    self.zoomScale.wrappedValue = scale
+                }
+                self.pinchGestureScale.wrappedValue = scale
+                self.pinchGestureState.wrappedValue = "changed"
+            }
+
+            pendingMagnificationCommit?.cancel()
+
+            let workItem = DispatchWorkItem { [weak self, weak webView] in
+                guard let self, let webView else { return }
+                self.isPinching = false
+                DispatchQueue.main.async {
+                    if abs(self.frameScale.wrappedValue - scale) > 0.001 {
+                        self.frameScale.wrappedValue = scale
+                    }
+                    self.pinchGestureScale.wrappedValue = scale
+                    self.pinchGestureState.wrappedValue = scale > 1.001 ? "ended" : "idle"
+                }
+                self.alignContentToTop(in: webView)
+                self.scheduleMacAlignmentRefresh(in: webView)
+                self.updateMetrics(in: webView)
+                self.refreshMetrics(in: webView, attemptsRemaining: 4)
+            }
+
+            pendingMagnificationCommit = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+        }
+
+        private func handlePlatformLayout(in webView: PlatformWKWebView) {
+            guard !isPinching else { return }
+            guard max(webView.magnification, frameScale.wrappedValue) > 1.001 else { return }
+
+            DispatchQueue.main.async { [weak self, weak webView] in
+                guard let self, let webView else { return }
+                self.alignContentToTop(in: webView)
+            }
+        }
+
+        private func scheduleMacAlignmentRefresh(
+            in webView: WKWebView,
+            attemptsRemaining: Int = 8
+        ) {
+            guard attemptsRemaining > 0 else { return }
+
+            pendingAlignmentWorkItem?.cancel()
+
+            let workItem = DispatchWorkItem { [weak self, weak webView] in
+                guard let self, let webView else { return }
+                self.alignContentToTop(in: webView)
+                self.scheduleMacAlignmentRefresh(
+                    in: webView,
+                    attemptsRemaining: attemptsRemaining - 1
+                )
+            }
+
+            pendingAlignmentWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: workItem)
+        }
+        #endif
 
         private func alignContentToTop(in webView: WKWebView) {
+            #if os(iOS)
             let topOffset = -webView.scrollView.adjustedContentInset.top
             let currentOffset = webView.scrollView.contentOffset
             guard abs(currentOffset.y - topOffset) > 0.5 else { return }
@@ -307,10 +632,21 @@ struct PlainWebView: UIViewRepresentable {
                 CGPoint(x: currentOffset.x, y: topOffset),
                 animated: false
             )
+            #else
+            (webView as? PlatformWKWebView)?.alignMagnifiedContentToTop()
+            webView.evaluateJavaScript("window.scrollTo(window.scrollX, 0);")
+            #endif
         }
 
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-            false
+        private func lockBaseHeightIfNeeded() {
+            guard !hasLockedBaseHeight else { return }
+
+            let snapshotHeight = max(baseContentHeight.wrappedValue, 1)
+            if snapshotHeight > 1 {
+                lockedBaseHeight = snapshotHeight
+            }
+
+            hasLockedBaseHeight = true
         }
     }
 }
@@ -385,9 +721,11 @@ struct WebZoomView: View {
             .frame(maxWidth: .infinity, alignment: .top)
         }
         .background(.background)
+        #if os(iOS)
         .animation(.interactiveSpring(), value: zoomScale)
         .animation(.interactiveSpring(), value: frameScale)
         .animation(.interactiveSpring(), value: baseContentHeight)
+        #endif
     }
 }
 
